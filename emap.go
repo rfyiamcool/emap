@@ -10,12 +10,13 @@ import (
 type TTLMapOption func(m *TTLMap) error
 
 type TTLMap struct {
-	running     bool
-	capacity    int
-	elements    map[string]*mapElement
-	expiryTimes *MinHeap
-	clock       time.Time
-	mutex       *sync.RWMutex
+	running      bool
+	capacity     int
+	maxFreeCount int
+	elements     map[string]*mapElement
+	expiryTimes  *MinHeap
+	clock        time.Time
+	mutex        *sync.RWMutex
 
 	// onExpire callback will be called when element is expired
 	onExpire Callback
@@ -34,11 +35,12 @@ func NewMap(capacity int, opts ...TTLMapOption) (*TTLMap, error) {
 	}
 
 	m := &TTLMap{
-		running:     true,
-		capacity:    capacity,
-		elements:    make(map[string]*mapElement),
-		expiryTimes: NewMinHeap(),
-		mutex:       new(sync.RWMutex),
+		running:      true,
+		capacity:     capacity,
+		maxFreeCount: defaultMaxFreeCount,
+		elements:     make(map[string]*mapElement),
+		expiryTimes:  NewMinHeap(),
+		mutex:        new(sync.RWMutex),
 	}
 
 	for _, o := range opts {
@@ -65,7 +67,7 @@ func (m *TTLMap) StartActiveGC(d time.Duration) error {
 	for m.running {
 		time.Sleep(d)
 		if len(m.elements) >= m.capacity {
-			m.freeSpace(1)
+			m.freeSpace(m.maxFreeCount)
 		}
 	}
 	return nil
@@ -107,6 +109,32 @@ func (m *TTLMap) Get(key string) (interface{}, bool) {
 	return value, true
 }
 
+func (m *TTLMap) Del(key string) error {
+	if m.mutex != nil {
+		m.mutex.RLock()
+		defer m.mutex.RUnlock()
+	}
+
+	mapEl, ok := m.elements[key]
+	if !ok {
+		return errors.New("not found")
+	}
+
+	m.del(mapEl)
+	return nil
+}
+
+func (m *TTLMap) Range(f func(k string, v interface{})) {
+	if m.mutex != nil {
+		m.mutex.RLock()
+		defer m.mutex.RUnlock()
+	}
+
+	for k, v := range m.elements {
+		f(k, v)
+	}
+}
+
 func (m *TTLMap) Increment(key string, value int, ttlSeconds int) (int, error) {
 	expiryTime, err := m.toEpochSeconds(ttlSeconds)
 	if err != nil {
@@ -134,6 +162,7 @@ func (m *TTLMap) Increment(key string, value int, ttlSeconds int) (int, error) {
 	return currentValue, nil
 }
 
+// GetInt get value and transport interface{} to int. return int value, exists_bool, type error
 func (m *TTLMap) GetInt(key string) (int, bool, error) {
 	valueI, exists := m.Get(key)
 	if !exists {
@@ -146,6 +175,18 @@ func (m *TTLMap) GetInt(key string) (int, bool, error) {
 	return value, true, nil
 }
 
+func (m *TTLMap) GetString(key string) (string, bool, error) {
+	valueI, exists := m.Get(key)
+	if !exists {
+		return "", false, nil
+	}
+	value, ok := valueI.(string)
+	if !ok {
+		return "", false, fmt.Errorf("Expected existing value to be string, got %T", valueI)
+	}
+	return value, true, nil
+}
+
 func (m *TTLMap) set(key string, value interface{}, expiryTime int) error {
 	if mapEl, ok := m.elements[key]; ok {
 		mapEl.value = value
@@ -154,7 +195,7 @@ func (m *TTLMap) set(key string, value interface{}, expiryTime int) error {
 	}
 
 	if len(m.elements) >= m.capacity {
-		m.freeSpace(1)
+		m.freeSpace(m.maxFreeCount)
 	}
 	heapEl := &Element{
 		Priority: expiryTime,
@@ -189,7 +230,7 @@ func (m *TTLMap) get(key string) (*mapElement, bool) {
 	if !ok {
 		return nil, false
 	}
-	// now := int(m.clock.UtcNow().Unix())
+
 	now := int(time.Now().Unix())
 	expired := mapEl.heapEl.Priority <= now
 	return mapEl, expired
@@ -206,7 +247,7 @@ func (m *TTLMap) lockNDel(mapEl *mapElement) {
 		if mapEl, ok = m.elements[mapEl.key]; !ok {
 			return
 		}
-		// now := int(m.clock.UtcNow().Unix())
+
 		now := int(time.Now().Unix())
 		if mapEl.heapEl.Priority > now {
 			return
@@ -229,12 +270,12 @@ func (m *TTLMap) freeSpace(count int) {
 	if removed >= count {
 		return
 	}
+
 	m.removeLastUsed(count - removed)
 }
 
 func (m *TTLMap) removeExpired(iterations int) int {
 	removed := 0
-	// now := int(m.clock.UtcNow().Unix())
 	now := int(time.Now().Unix())
 	for i := 0; i < iterations; i += 1 {
 		if len(m.elements) == 0 {
