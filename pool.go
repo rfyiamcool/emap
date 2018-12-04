@@ -106,10 +106,15 @@ func (p *TTLMapPool) Stop() {
 	}
 }
 
-func (p *TTLMapPool) StartGC(d time.Duration) {
+func (p *TTLMapPool) StartGC(d time.Duration) error {
+	if d.Seconds() < 1 {
+		return errors.New("startGC interval must > 1 second")
+	}
 	for _, bucket := range p.buckets {
 		go bucket.StartActiveGC(d)
 	}
+
+	return nil
 }
 
 func (p *TTLMapPool) GetBucket(key string) *TTLMap {

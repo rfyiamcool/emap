@@ -15,7 +15,6 @@ type TTLMap struct {
 	maxFreeCount int
 	elements     map[string]*mapElement
 	expiryTimes  *MinHeap
-	clock        time.Time
 	mutex        *sync.RWMutex
 
 	// onExpire callback will be called when element is expired
@@ -49,18 +48,7 @@ func NewMap(capacity int, opts ...TTLMapOption) (*TTLMap, error) {
 		}
 	}
 
-	if m.clock.IsZero() {
-		m.clock = time.Now()
-	}
-
 	return m, nil
-}
-
-func NewMapWithProvider(capacity int, timeProvider time.Time) (*TTLMap, error) {
-	if timeProvider.IsZero() {
-		return nil, errors.New("Please pass timeProvider")
-	}
-	return NewMap(capacity, Clock(timeProvider))
 }
 
 func (m *TTLMap) StartActiveGC(d time.Duration) error {
@@ -309,14 +297,6 @@ func (m *TTLMap) toEpochSeconds(ttlSeconds int) (int, error) {
 		return 0, fmt.Errorf("ttlSeconds should be >= 0, got %d", ttlSeconds)
 	}
 	return int(time.Now().Add(time.Second * time.Duration(ttlSeconds)).Unix()), nil
-}
-
-// Clock sets the time provider clock, handy for testing
-func Clock(c time.Time) TTLMapOption {
-	return func(m *TTLMap) error {
-		m.clock = c
-		return nil
-	}
 }
 
 type Callback func(key string, el interface{})
