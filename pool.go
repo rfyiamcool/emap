@@ -12,28 +12,46 @@ const (
 )
 
 type TTLMapPool struct {
-	buckets      []*TTLMap
-	counter      int64
-	poolSize     int
-	maxFreeCount int
+	buckets            []*TTLMap
+	counter            int64
+	poolSize           int
+	triggerExpireCount int
+	maxFreeCount       int
+	gcInterval         time.Duration
+
 	sync.Mutex
 }
 
 func NewTTLMapPool(poolSize int, triggerExpireCount int) (*TTLMapPool, error) {
-	m := &TTLMapPool{
-		poolSize:     poolSize,
-		maxFreeCount: defaultMaxFreeCount,
+	if poolSize < 1 {
+		return nil, errors.New("poolSize must > 1")
 	}
-	m.buckets = make([]*TTLMap, poolSize)
-	for idx, _ := range m.buckets {
-		newM, err := NewMap(triggerExpireCount)
-		if err != nil {
-			return m, err
-		}
-		m.buckets[idx] = newM
+
+	m := &TTLMapPool{
+		poolSize:           poolSize,
+		triggerExpireCount: triggerExpireCount,
+		maxFreeCount:       defaultMaxFreeCount,
+		gcInterval:         30 * time.Second,
+	}
+	err := m.initPool()
+	if err != nil {
+		return m, err
 	}
 
 	return m, nil
+}
+
+func (p *TTLMapPool) initPool() error {
+	p.buckets = make([]*TTLMap, p.poolSize)
+	for idx, _ := range p.buckets {
+		newM, err := NewMap(p.triggerExpireCount)
+		if err != nil {
+			return err
+		}
+		p.buckets[idx] = newM
+	}
+
+	return nil
 }
 
 func (p *TTLMapPool) SetDefaultTTL(ttlSeconds int) error {
@@ -100,16 +118,31 @@ func (p *TTLMapPool) GC(args ...int) {
 	}
 }
 
-func (p *TTLMapPool) Stop() {
+func (p *TTLMapPool) Reset() {
+	p.StopGC()
+	p.initPool()
+	p.StartGC()
+}
+
+func (p *TTLMapPool) StopGC() {
 	for _, bucket := range p.buckets {
 		go bucket.Stop()
 	}
 }
 
-func (p *TTLMapPool) StartGC(d time.Duration) error {
+func (p *TTLMapPool) StartGC() {
+	for _, bucket := range p.buckets {
+		go bucket.StartActiveGC(p.gcInterval)
+	}
+}
+
+func (p *TTLMapPool) StartGCInterval(d time.Duration) error {
 	if d.Seconds() < 1 {
 		return errors.New("startGC interval must > 1 second")
 	}
+
+	// cover default value 30s
+	p.gcInterval = d
 	for _, bucket := range p.buckets {
 		go bucket.StartActiveGC(d)
 	}
