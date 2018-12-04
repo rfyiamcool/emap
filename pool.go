@@ -67,7 +67,7 @@ func (p *TTLMapPool) Set(key string, value interface{}, ttlSeconds int) error {
 	return bucket.Set(key, value, ttlSeconds)
 }
 
-func (p *TTLMapPool) Del(key string, value interface{}, ttlSeconds int) error {
+func (p *TTLMapPool) Del(key string) error {
 	bucket := p.GetBucket(key)
 	return bucket.Del(key)
 }
