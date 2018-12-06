@@ -7,39 +7,58 @@ import (
 	"time"
 )
 
-type TTLMapOption func(m *TTLMap) error
-
 type TTLMap struct {
-	running      bool
+	running bool
+
+	// store map default cap size, and thold of trigger freespace.
 	capacity     int
 	maxFreeCount int
-	elements     map[string]*mapElement
-	expiryTimes  *MinHeap
-	mutex        *sync.RWMutex
+	// if size > 0; open lru feature
+	lruMaxSize int
+
+	// save meta data
+	store       map[interface{}]*mapElement
+	lruCache    *LRU
+	expiryTimes *MinHeap
+
+	// lock
+	mutex *sync.RWMutex
 
 	// onExpire callback will be called when element is expired
 	onExpire Callback
 }
 
 type mapElement struct {
-	key    string
+	key    interface{}
 	value  interface{}
 	heapEl *Element
 }
 
+type TTLMapOption func(m *TTLMap) error
+
 // NewMap thread safe
-func NewMap(capacity int, opts ...TTLMapOption) (*TTLMap, error) {
-	if capacity <= 0 {
+func NewMap(option Options, opts ...TTLMapOption) (*TTLMap, error) {
+	if option.capacityBucket <= 0 {
 		return nil, errors.New("Capacity should be > 0")
 	}
 
 	m := &TTLMap{
 		running:      true,
-		capacity:     capacity,
+		capacity:     option.capacityBucket,
 		maxFreeCount: defaultMaxFreeCount,
-		elements:     make(map[string]*mapElement),
+		store:        make(map[interface{}]*mapElement, option.capacityBucket),
 		expiryTimes:  NewMinHeap(),
 		mutex:        new(sync.RWMutex),
+	}
+
+	if option.lruMaxSize > 0 {
+		bucketLruSize := option.lruMaxSize / option.poolSize
+		cache, err := NewLRU(bucketLruSize, nil)
+		if err != nil {
+			return m, err
+		}
+
+		m.lruCache = cache
 	}
 
 	for _, o := range opts {
@@ -54,9 +73,11 @@ func NewMap(capacity int, opts ...TTLMapOption) (*TTLMap, error) {
 func (m *TTLMap) StartActiveGC(d time.Duration) error {
 	for m.running {
 		time.Sleep(d)
-		if len(m.elements) >= m.capacity {
+		m.mutex.RLock()
+		if len(m.store) >= m.capacity {
 			m.freeSpace(m.maxFreeCount)
 		}
+		m.mutex.RUnlock()
 	}
 	return nil
 }
@@ -77,15 +98,7 @@ func (m *TTLMap) Set(key string, value interface{}, ttlSeconds int) error {
 	return m.set(key, value, expiryTime)
 }
 
-func (m *TTLMap) Len() int {
-	if m.mutex != nil {
-		m.mutex.RLock()
-		defer m.mutex.RUnlock()
-	}
-	return len(m.elements)
-}
-
-func (m *TTLMap) Get(key string) (interface{}, bool) {
+func (m *TTLMap) Get(key interface{}) (interface{}, bool) {
 	value, mapEl, expired := m.lockNGet(key)
 	if mapEl == nil {
 		return nil, false
@@ -97,13 +110,13 @@ func (m *TTLMap) Get(key string) (interface{}, bool) {
 	return value, true
 }
 
-func (m *TTLMap) Del(key string) error {
+func (m *TTLMap) Del(key interface{}) error {
 	if m.mutex != nil {
 		m.mutex.RLock()
 		defer m.mutex.RUnlock()
 	}
 
-	mapEl, ok := m.elements[key]
+	mapEl, ok := m.store[key]
 	if !ok {
 		return errors.New("not found")
 	}
@@ -112,18 +125,27 @@ func (m *TTLMap) Del(key string) error {
 	return nil
 }
 
-func (m *TTLMap) Range(f func(k string, v interface{})) {
+func (m *TTLMap) Len() int {
 	if m.mutex != nil {
 		m.mutex.RLock()
 		defer m.mutex.RUnlock()
 	}
 
-	for k, v := range m.elements {
+	return len(m.store)
+}
+
+func (m *TTLMap) Range(f func(k interface{}, v interface{})) {
+	if m.mutex != nil {
+		m.mutex.RLock()
+		defer m.mutex.RUnlock()
+	}
+
+	for k, v := range m.store {
 		f(k, v)
 	}
 }
 
-func (m *TTLMap) Increment(key string, value int, ttlSeconds int) (int, error) {
+func (m *TTLMap) Increment(key interface{}, value int, ttlSeconds int) (int, error) {
 	expiryTime, err := m.toEpochSeconds(ttlSeconds)
 	if err != nil {
 		return 0, err
@@ -151,7 +173,7 @@ func (m *TTLMap) Increment(key string, value int, ttlSeconds int) (int, error) {
 }
 
 // GetInt get value and transport interface{} to int. return int value, exists_bool, type error
-func (m *TTLMap) GetInt(key string) (int, bool, error) {
+func (m *TTLMap) GetInt(key interface{}) (int, bool, error) {
 	valueI, exists := m.Get(key)
 	if !exists {
 		return 0, false, nil
@@ -163,7 +185,7 @@ func (m *TTLMap) GetInt(key string) (int, bool, error) {
 	return value, true, nil
 }
 
-func (m *TTLMap) GetString(key string) (string, bool, error) {
+func (m *TTLMap) GetString(key interface{}) (string, bool, error) {
 	valueI, exists := m.Get(key)
 	if !exists {
 		return "", false, nil
@@ -175,16 +197,19 @@ func (m *TTLMap) GetString(key string) (string, bool, error) {
 	return value, true, nil
 }
 
-func (m *TTLMap) set(key string, value interface{}, expiryTime int) error {
-	if mapEl, ok := m.elements[key]; ok {
+func (m *TTLMap) set(key interface{}, value interface{}, expiryTime int) error {
+	if mapEl, ok := m.store[key]; ok {
 		mapEl.value = value
 		m.expiryTimes.UpdateEl(mapEl.heapEl, expiryTime)
 		return nil
 	}
 
-	if len(m.elements) >= m.capacity {
+	// gc
+	if len(m.store) >= m.capacity {
 		m.freeSpace(m.maxFreeCount)
 	}
+
+	// expire heap
 	heapEl := &Element{
 		Priority: expiryTime,
 	}
@@ -194,12 +219,20 @@ func (m *TTLMap) set(key string, value interface{}, expiryTime int) error {
 		heapEl: heapEl,
 	}
 	heapEl.Value = mapEl
-	m.elements[key] = mapEl
+	m.store[key] = mapEl
 	m.expiryTimes.PushEl(heapEl)
+
+	// lru cache
+	if m.lruCache != nil {
+		ent, isFull := m.lruCache.add(key, mapEl)
+		if isFull {
+			m.del(ent.value.(*mapElement))
+		}
+	}
 	return nil
 }
 
-func (m *TTLMap) lockNGet(key string) (value interface{}, mapEl *mapElement, expired bool) {
+func (m *TTLMap) lockNGet(key interface{}) (value interface{}, mapEl *mapElement, expired bool) {
 	if m.mutex != nil {
 		m.mutex.RLock()
 		defer m.mutex.RUnlock()
@@ -213,14 +246,20 @@ func (m *TTLMap) lockNGet(key string) (value interface{}, mapEl *mapElement, exp
 	return value, mapEl, expired
 }
 
-func (m *TTLMap) get(key string) (*mapElement, bool) {
-	mapEl, ok := m.elements[key]
+func (m *TTLMap) get(key interface{}) (*mapElement, bool) {
+	mapEl, ok := m.store[key]
 	if !ok {
 		return nil, false
 	}
 
 	now := int(time.Now().Unix())
 	expired := mapEl.heapEl.Priority <= now
+
+	// lru cache
+	if m.lruCache != nil {
+		m.lruCache.get(key)
+	}
+
 	return mapEl, expired
 }
 
@@ -232,7 +271,7 @@ func (m *TTLMap) lockNDel(mapEl *mapElement) {
 		// Map element could have been updated. Now that we have a lock
 		// retrieve it again and check if it is still expired.
 		var ok bool
-		if mapEl, ok = m.elements[mapEl.key]; !ok {
+		if mapEl, ok = m.store[mapEl.key]; !ok {
 			return
 		}
 
@@ -249,8 +288,13 @@ func (m *TTLMap) del(mapEl *mapElement) {
 		m.onExpire(mapEl.key, mapEl.value)
 	}
 
-	delete(m.elements, mapEl.key)
+	delete(m.store, mapEl.key)
 	m.expiryTimes.RemoveEl(mapEl.heapEl)
+
+	// lru cache
+	if m.lruCache != nil {
+		m.lruCache.remove(mapEl.key)
+	}
 }
 
 func (m *TTLMap) freeSpace(count int) {
@@ -259,14 +303,14 @@ func (m *TTLMap) freeSpace(count int) {
 		return
 	}
 
-	m.removeLastUsed(count - removed)
+	// m.removeLastUsed(count - removed)
 }
 
 func (m *TTLMap) removeExpired(iterations int) int {
 	removed := 0
 	now := int(time.Now().Unix())
 	for i := 0; i < iterations; i += 1 {
-		if len(m.elements) == 0 {
+		if len(m.store) == 0 {
 			break
 		}
 		heapEl := m.expiryTimes.PeekEl()
@@ -275,7 +319,11 @@ func (m *TTLMap) removeExpired(iterations int) int {
 		}
 		m.expiryTimes.PopEl()
 		mapEl := heapEl.Value.(*mapElement)
-		delete(m.elements, mapEl.key)
+		delete(m.store, mapEl.key)
+		// lru cache
+		if m.lruCache != nil {
+			m.lruCache.remove(mapEl.key)
+		}
 		removed += 1
 	}
 	return removed
@@ -283,12 +331,12 @@ func (m *TTLMap) removeExpired(iterations int) int {
 
 func (m *TTLMap) removeLastUsed(iterations int) {
 	for i := 0; i < iterations; i += 1 {
-		if len(m.elements) == 0 {
+		if len(m.store) == 0 {
 			return
 		}
 		heapEl := m.expiryTimes.PopEl()
 		mapEl := heapEl.Value.(*mapElement)
-		delete(m.elements, mapEl.key)
+		delete(m.store, mapEl.key)
 	}
 }
 
@@ -299,9 +347,9 @@ func (m *TTLMap) toEpochSeconds(ttlSeconds int) (int, error) {
 	return int(time.Now().Add(time.Second * time.Duration(ttlSeconds)).Unix()), nil
 }
 
-type Callback func(key string, el interface{})
+type Callback func(key interface{}, el interface{})
 
-// CallOnExpire will call this callback on expiration of elements
+// CallOnExpire will call this callback on expiration of store
 func CallOnExpire(cb Callback) TTLMapOption {
 	return func(m *TTLMap) error {
 		m.onExpire = cb
