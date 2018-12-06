@@ -126,11 +126,7 @@ func (m *TTLMap) Del(key interface{}) error {
 }
 
 func (m *TTLMap) Len() int {
-	if m.mutex != nil {
-		m.mutex.RLock()
-		defer m.mutex.RUnlock()
-	}
-
+	// don't need lock, hmap struct contains count field.
 	return len(m.store)
 }
 
