@@ -8,7 +8,6 @@ import (
 // EvictCallback is used to get a callback when a cache entry is evicted
 type EvictCallback func(key interface{}, value interface{})
 
-// LRU implements a non-thread safe fixed size LRU cache
 type LRU struct {
 	size      int
 	evictList *list.List
@@ -22,7 +21,7 @@ type entry struct {
 }
 
 // NewLRU constructs an LRU of the given size
-func NewLRU(size int, onEvict EvictCallback) (*LRU, error) {
+func newLRU(size int, onEvict EvictCallback) (*LRU, error) {
 	if size <= 0 {
 		return nil, errors.New("Must provide a positive size")
 	}
@@ -36,7 +35,7 @@ func NewLRU(size int, onEvict EvictCallback) (*LRU, error) {
 }
 
 // Purge is used to completely clear the cache.
-func (c *LRU) Purge() {
+func (c *LRU) purge() {
 	for k, v := range c.items {
 		if c.onEvict != nil {
 			c.onEvict(k, v.Value.(*entry).value)
@@ -82,8 +81,7 @@ func (c *LRU) contains(key interface{}) (ok bool) {
 	return ok
 }
 
-// Remove removes the provided key from the cache, returning if the
-// key was contained.
+// Remove remove key from the cache
 func (c *LRU) remove(key interface{}) (present bool) {
 	if ent, ok := c.items[key]; ok {
 		c.removeElement(ent)

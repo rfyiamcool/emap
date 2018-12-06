@@ -53,7 +53,7 @@ func NewMap(option Options, opts ...TTLMapOption) (*TTLMap, error) {
 
 	if option.lruMaxSize > 0 {
 		bucketLruSize := option.lruMaxSize / option.poolSize
-		cache, err := NewLRU(bucketLruSize, nil)
+		cache, err := newLRU(bucketLruSize, nil)
 		if err != nil {
 			return m, err
 		}
@@ -293,13 +293,24 @@ func (m *TTLMap) del(mapEl *mapElement) {
 	}
 }
 
+func (m *TTLMap) delStoreOnly(mapEl *mapElement) {
+	if m.onExpire != nil {
+		m.onExpire(mapEl.key, mapEl.value)
+	}
+
+	delete(m.store, mapEl.key)
+
+	// lru cache
+	if m.lruCache != nil {
+		m.lruCache.remove(mapEl.key)
+	}
+}
+
 func (m *TTLMap) freeSpace(count int) {
 	removed := m.removeExpired(count)
 	if removed >= count {
 		return
 	}
-
-	// m.removeLastUsed(count - removed)
 }
 
 func (m *TTLMap) removeExpired(iterations int) int {
@@ -315,16 +326,13 @@ func (m *TTLMap) removeExpired(iterations int) int {
 		}
 		m.expiryTimes.PopEl()
 		mapEl := heapEl.Value.(*mapElement)
-		delete(m.store, mapEl.key)
-		// lru cache
-		if m.lruCache != nil {
-			m.lruCache.remove(mapEl.key)
-		}
+		m.delStoreOnly(mapEl)
 		removed += 1
 	}
 	return removed
 }
 
+// removeLastUsed force remove item, contains un expire item.
 func (m *TTLMap) removeLastUsed(iterations int) {
 	for i := 0; i < iterations; i += 1 {
 		if len(m.store) == 0 {
@@ -332,7 +340,7 @@ func (m *TTLMap) removeLastUsed(iterations int) {
 		}
 		heapEl := m.expiryTimes.PopEl()
 		mapEl := heapEl.Value.(*mapElement)
-		delete(m.store, mapEl.key)
+		m.delStoreOnly(mapEl)
 	}
 }
 
